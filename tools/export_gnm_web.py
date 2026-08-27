@@ -134,6 +134,65 @@ def run_mlp(layers, x):
   return x
 
 
+def build_render_uvs(triangles, triangle_uvs, num_vertices):
+  """Turns GNM's per-corner UVs into per-vertex UVs for a WebGL mesh.
+
+  A vertex on a UV seam carries a different UV in each island it belongs to,
+  which one vertex buffer cannot express, so seam vertices are duplicated. The
+  first num_vertices render vertices stay in GNM order, so anything indexing by
+  model vertex - the wireframe, landmarks, skinning - keeps working untouched;
+  duplicates are appended and carry the index they copy their position from.
+
+  Args:
+    triangles: Per-corner vertex indices, (T, 3).
+    triangle_uvs: Per-corner texture coordinates, (T, 3, 2).
+    num_vertices: The model's vertex count V.
+
+  Returns:
+    (uvs, source, uv_triangles): float32 (Vr, 2) texture coordinates, uint16
+    (Vr,) render-to-model vertex map, and uint16 (T, 3) triangles reindexed
+    onto the render vertices.
+  """
+  # Kept at float64 while building: the quantized UVs are compared for exact
+  # equality, and float32 would not round-trip them.
+  uvs = np.zeros((num_vertices, 2), dtype=np.float64)
+  source = np.arange(num_vertices, dtype=np.uint16)
+  assigned = np.zeros(num_vertices, dtype=bool)
+  # Maps (model vertex, quantized uv) to the render vertex holding it.
+  duplicates = {}
+  extra_uvs = []
+  extra_source = []
+  uv_triangles = np.array(triangles, dtype=np.int64, copy=True)
+
+  quantized = np.round(triangle_uvs.astype(np.float64), 5)
+  for face in range(len(triangles)):
+    for corner in range(3):
+      vertex = int(triangles[face, corner])
+      uv = quantized[face, corner]
+      if not assigned[vertex]:
+        uvs[vertex] = uv
+        assigned[vertex] = True
+        continue
+      if uvs[vertex, 0] == uv[0] and uvs[vertex, 1] == uv[1]:
+        continue
+      key = (vertex, uv[0], uv[1])
+      index = duplicates.get(key)
+      if index is None:
+        index = num_vertices + len(extra_uvs)
+        duplicates[key] = index
+        extra_uvs.append(uv)
+        extra_source.append(vertex)
+      uv_triangles[face, corner] = index
+
+  if extra_uvs:
+    uvs = np.concatenate([uvs, np.array(extra_uvs, dtype=np.float64)])
+    source = np.concatenate(
+        [source, np.array(extra_source, dtype=np.uint16)])
+  if len(uvs) > 65535:
+    raise ValueError(f'{len(uvs)} render vertices overflows a uint16 index.')
+  return uvs.astype(np.float32), source, uv_triangles.astype(np.uint16)
+
+
 def main():
   parser = argparse.ArgumentParser()
   script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -246,6 +305,13 @@ def main():
   landmark_weights = landmarks[:, 1::2].astype(np.float32)
   print(f'Landmarks: {landmark_indices.shape[0]}')
 
+  # ---- UV unwrap. -----------------------------------------------------------
+  render_uvs, uv_source, uv_triangles = build_render_uvs(
+      d['triangles'], d['triangle_uvs'], num_vertices)
+  num_render_vertices = len(uv_source)
+  print(f'UVs: {num_render_vertices} render vertices '
+        f'({num_render_vertices - num_vertices} seam duplicates)')
+
   # ---- Write the model container. ------------------------------------------
   writer = ContainerWriter()
   writer.add('template', d['template_vertex_positions'].astype(np.float32))
@@ -267,6 +333,9 @@ def main():
   writer.add('component_id', component_id)
   writer.add('material_id', material_id)
   writer.add('region_id', region_id)
+  writer.add('vertex_uvs', render_uvs)
+  writer.add('uv_source', uv_source)
+  writer.add('uv_triangles', uv_triangles)
   writer.add('landmark_indices', landmark_indices)
   writer.add('landmark_weights', landmark_weights)
 
@@ -275,6 +344,7 @@ def main():
       'gnmVersion': str(d['version']),
       'variant': str(d['variant']),
       'numVertices': int(num_vertices),
+      'numRenderVertices': int(num_render_vertices),
       'numJoints': int(num_joints),
       'identityDim': int(identity_dim),
       'expressionDim': int(expression_dim),
@@ -289,6 +359,23 @@ def main():
       'hasPoseCorrectives': has_pose_correctives,
   }
   writer.write(os.path.join(args.out_dir, 'gnm_head_web.bin'), meta)
+
+  # ---- UV sidecar. ----------------------------------------------------------
+  # The same UV sections on their own, so a viewer holding an older model
+  # container (the ones on the CDN carry no UVs) can pick up texturing without
+  # re-downloading 35 MB of bases.
+  uv_writer = ContainerWriter()
+  uv_writer.add('vertex_uvs', render_uvs)
+  uv_writer.add('uv_source', uv_source)
+  uv_writer.add('uv_triangles', uv_triangles)
+  uv_writer.write(
+      os.path.join(args.out_dir, 'gnm_head_uvs.bin'), {
+          'model': 'GNM Head UVs',
+          'gnmVersion': str(d['version']),
+          'variant': str(d['variant']),
+          'numVertices': int(num_vertices),
+          'numRenderVertices': int(num_render_vertices),
+      })
 
   # ---- Semantic sampler decoders. ------------------------------------------
   sampler_writer = ContainerWriter()
